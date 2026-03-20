@@ -509,6 +509,8 @@ def _process_one_offline(
 # ──────────────────────────────────────────────
 
 async def main() -> None:
+    global MODEL_NAME
+
     # ── CLI args ──────────────────────────────
     parser = argparse.ArgumentParser(description="Process HPC tickets → benchmark JSON")
     parser.add_argument(
@@ -565,7 +567,6 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    global MODEL_NAME
     MODEL_NAME = args.model
 
     log.info("Loading tickets from %s …", INPUT_FILE)
