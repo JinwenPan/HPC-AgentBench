@@ -1,0 +1,28 @@
+[project]
+name = "aleph"
+version = "0.1.0"
+description = "LLM-driven Semantic HNSW Index"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy<2.0.0",
+    "pydantic",
+    "pyyaml",
+    "tqdm",
+    "scikit-learn", # For cosine similarity in mock
+    "torch",
+    "faiss-gpu",
+    "FlagEmbedding",
+    "pytrec-eval-terrier",
+    "google-generativeai",
+    "datasets",
+    "openai",
+    "vllm",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
