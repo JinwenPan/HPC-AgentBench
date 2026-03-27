@@ -1,721 +1,1037 @@
 #!/usr/bin/env python3
 """
-process_tickets.py — Async HPC Ticket → Agentic Benchmark Transformer
+Multi-stage pipeline for building HPC-AgentBench v2 from raw tickets.
 
-Reads tickets_combined.json    → calls local vLLM (OpenAI-compatible)
-                                → writes benchmark_results.json
+Stages:
+  1. preclassify
+  2. generate_candidate
+  3. validate_candidate
+  4. repair_or_filter
 
-Features:
-  • asyncio + openai.AsyncOpenAI for fully async I/O
-  • Semaphore-based concurrency control (default 50)
-  • Resumability: checkpoint JSONL + periodic JSON saves
-  • Graceful shutdown on SIGINT/SIGTERM — always saves progress
-  • Robust JSON parsing with markdown fence stripping + retries
-  • Pre-filters empty / short tickets (<50 chars) without API calls
-  • tqdm progress bar
+The pipeline uses local vLLM inference, with offline in-process mode as the
+primary execution path. It writes stage outputs as JSONL and exports both
+canonical and runtime benchmark artifacts.
 """
 
 import argparse
-import asyncio
 import json
 import logging
-import re
-import signal
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from benchmark_semantics import audit_cleaned_dataset
+from dataset_schema import (
+    apply_validation_verdict,
+    deterministic_validate_canonical,
+    extract_reference_admin_reply,
+    format_ticket_conversation,
+    merge_validation_verdict,
+    normalize_canonical_candidate,
+    preclassify_ticket,
+    project_runtime_record,
+    summarize_canonical_dataset,
+)
+from llm_config import (
+    DEFAULT_LLM_MODEL,
+    DEFAULT_OFFLINE_DTYPE,
+    DEFAULT_OFFLINE_ENABLE_CHUNKED_PREFILL,
+    DEFAULT_OFFLINE_GPU_MEMORY_UTILIZATION,
+    DEFAULT_OFFLINE_MAX_MODEL_LEN,
+    DEFAULT_OFFLINE_QUANTIZATION,
+    DEFAULT_OFFLINE_TENSOR_PARALLEL_SIZE,
+    DEFAULT_SERVER_API_KEY,
+    DEFAULT_SERVER_BASE_URL,
+)
+from local_llm import LocalLLMClient
 from tqdm import tqdm
 
-# ──────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────
 INPUT_FILE = Path(__file__).parent / "tickets_combined.json"
-OUTPUT_FILE = Path(__file__).parent / "benchmark_results.json"
-CHECKPOINT_FILE = Path(__file__).parent / ".benchmark_checkpoint.jsonl"
-API_BASE = "http://localhost:8000/v1"
-API_KEY = "EMPTY"
-MODEL_NAME = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
-BACKEND_MODE = "server"        # one of: server, offline
-MAX_CONCURRENT = 50          # asyncio.Semaphore limit
-MAX_RETRIES = 5              # retries per ticket (covers both API + parse errors)
-MIN_TICKET_CHARS = 0       # skip tickets shorter than this
-TEMPERATURE = 0.0            # deterministic
-REQUEST_TIMEOUT = 180        # seconds per API request
-SAVE_EVERY = 500             # write JSON snapshot every N completed tickets
-OFFLINE_MAX_TOKENS = 0
-OFFLINE_TENSOR_PARALLEL_SIZE = 1
-OFFLINE_GPU_MEMORY_UTILIZATION = 0.90
-OFFLINE_MAX_MODEL_LEN = 65536
-OFFLINE_DTYPE = "bfloat16"
-OFFLINE_QUANTIZATION = "fp8"
+DEFAULT_OUTPUT_DIR = Path(__file__).parent / "pipeline_outputs"
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_MAX_RETRIES = 3
+GENERATOR_MAX_TOKENS = 2048
+VALIDATOR_MAX_TOKENS = 768
+REPAIR_MAX_TOKENS = 2048
+DEFAULT_TEMPERATURE = 0.0
 
-# ──────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stderr),
-        logging.FileHandler(Path(__file__).parent / "process_tickets.log"),
-    ],
-)
-log = logging.getLogger(__name__)
+PRECLASSIFY_FILE = "preclassify.jsonl"
+CANDIDATE_FILE = "candidate.jsonl"
+VALIDATED_FILE = "validated.jsonl"
+FINAL_CANONICAL_FILE = "canonical.jsonl"
+RUNTIME_GROUNDED_FILE = "runtime.grounded.json"
+RUNTIME_RECONSTRUCTED_FILE = "runtime.reconstructed.json"
+QUALITY_REPORT_FILE = "quality_report.json"
 
-# Suppress noisy per-request HTTP logs from the openai/httpx client
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
-logging.getLogger("vllm").setLevel(logging.WARNING)
+GENERATOR_SYSTEM_PROMPT = """\
+You are building a publishable benchmark dataset for an HPC support agent.
 
-# ──────────────────────────────────────────────
-# System prompt (embedded constant)
-# ──────────────────────────────────────────────
-SYSTEM_PROMPT = """\
-You are an expert HPC Sysadmin and Test Engineer. Convert the following \
-support ticket into an interactive agent test case.
+Your task is to transform one raw human/admin support ticket into a canonical
+candidate record for a trace-based benchmark.
 
-Assume the test agent can use exactly 3 tools:
-    1) execute_bash(command)
-         - Meaning: run a shell command to inspect/diagnose/fix cluster state.
-         - Parameter: the exact bash command string.
-    2) search_docs(query)
-         - Meaning: search documentation, KB pages, or policy references.
-         - Parameter: a concise search query.
-    3) ask_user_for_info(question)
-         - Meaning: ask the end user for missing context.
-         - Parameter: the exact question asked to the user.
+Important rules:
+- The output must be valid JSON only.
+- Tools are limited to execute_bash, search_docs, ask_user_for_info.
+- If the raw ticket contains any assistant reply, `evaluation.reference_admin_reply`
+  must copy the final raw assistant reply verbatim. Do not rewrite, polish,
+  summarize, expand, or idealize it.
+- If the raw ticket lacks assistant replies, you MUST NOT fabricate a grounded
+  reference_admin_reply. Such samples should usually be reconstructed.
+- Grounded samples must stay faithful to the raw ticket. Do not invent a
+  detailed failure path, job ID, path, or policy step unless it is directly
+  grounded in the ticket or introduced via ask_user_for_info.
+- Do not turn support links, portal URLs, or generic admin instructions into
+  synthetic curl/wget page checks unless the raw ticket explicitly contains
+  those commands or their observed outputs.
+- If the raw ticket already quotes commands, shell values, file paths,
+  hostnames, or observed command/error output, prefer extracting those into
+  grounded execute_bash/search_docs traces instead of replacing them with
+  ask_user_for_info.
+- If the raw ticket only reports a high-level request plus a final admin-side
+  resolution, do not invent a long execute_bash/search_docs workflow to fill
+  in the missing internal support steps. That belongs in reconstructed, not
+  grounded.
+- If the initial user request is vague or underspecified and there is no later
+  user follow-up clarifying the task, prefer `reconstructed` instead of
+  fabricating a very specific grounded benchmark scenario.
+- Reconstructed samples may expand the scenario, but they must stay plausible
+  for HPC ticket handling and must not masquerade as grounded.
+- Any hidden username, job ID, path, or resource value needed by later traces
+  must appear first through ask_user_for_info or a prior mock_output.
+- Do not add ask_user_for_info if the needed information already appears in the
+  raw ticket conversation.
 
-Extract the implied troubleshooting workflow from the full ticket and map it
-into a flat list of traces. Each trace item must contain one action trigger
-and one simulated output.
-
-IMPORTANT:
-    - Do NOT include submit_solution in traces.
-    - A ticket may require multiple actions.
-    - The same action type may appear multiple times.
-    - trigger_command must always be exactly action(parameter) where action is
-        one of execute_bash, search_docs, ask_user_for_info.
-
-CRITICAL — Information Gating:
-  If the admin checked a file or ran a diagnostic, the FIRST mock command \
-    (e.g. execute_bash(squeue), execute_bash(scontrol show job)) MUST reveal a specific, hallucinated \
-  absolute path (e.g. /work/01234/user/job.err).  The agent must then use \
-    that exact absolute path in the subsequent trigger_command \
-    (e.g. execute_bash(cat /work/01234/user/job.err)).  Do NOT allow relative paths.
-
-If the ticket is empty, purely conversational, or lacks any technical \
-troubleshooting steps, return ONLY:
-  {"is_valid": false}
-
-Otherwise return ONLY valid JSON matching this schema (no extra keys, \
-no markdown fences, no commentary):
+Return exactly one JSON object with this schema:
 {
-  "instance_id": "<ticket_id>",
+  "instance_id": "<ticket id>",
   "is_valid": true,
-  "instruction": "<The user's initial prompt/error. Do NOT include admin replies.>",
+  "release_tier": "grounded" or "reconstructed",
+  "construction_mode": "extracted" or "reconstructed",
+  "instruction": "<initial user-facing problem statement>",
   "traces": [
     {
-        "trigger_command": "<One action(parameter), e.g. execute_bash(ls -a ~)>",
-        "mock_output": "<Simulated output for that action; may include paths, node IDs, policy text, or user reply>"
+      "tool": "execute_bash" | "search_docs" | "ask_user_for_info",
+      "argument": "<tool argument>",
+      "trigger_command": "<tool(argument)>",
+      "mock_output": "<simulated observation>",
+      "observation_source": "bash" | "docs" | "user",
+      "grounding": "grounded" | "inferred",
+      "required": true
     }
   ],
   "evaluation": {
-    "expected_trajectory": ["<Step 1>", "<Step 2>"],
-    "final_solution_criteria": ["<Criterion 1>", "<Criterion 2>"],
-    "reference_admin_reply": "<The original admin's final solution>"
+    "expected_trajectory": ["..."],
+    "final_solution_criteria": ["..."],
+    "reference_admin_reply": "<empty string if none>",
+    "has_reference_admin_reply": true or false
   }
 }
 
-Return ONLY valid JSON. No markdown. No explanation."""
+`trigger_command` must always use the exact canonical form `tool(argument)`.
+Do not output bare strings like `search_docs foo bar` or `execute_bash ls -l`.
 
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
+If the ticket is clearly unusable as a benchmark item, return:
+{"instance_id":"<ticket id>","is_valid":false}
+"""
 
-# Regex to strip ```json ... ``` fences (with optional language tag)
-_FENCE_RE = re.compile(
-    r"```(?:json)?\s*\n?(.*?)\n?\s*```",
-    re.DOTALL | re.IGNORECASE,
+VALIDATOR_SYSTEM_PROMPT = """\
+You are a QA verifier for a benchmark dataset built from raw HPC support tickets.
+
+You will receive:
+1. the raw ticket conversation,
+2. a preclassification summary,
+3. a candidate canonical record,
+4. deterministic QA flags.
+
+Decide whether the candidate should be valid, whether it belongs in grounded or
+reconstructed release tier, whether the reference_admin_reply is truly grounded
+in the raw ticket, and whether repair is needed.
+
+Be strict about these failure modes:
+- The candidate rewrites or embellishes the final assistant reply instead of
+  copying it verbatim.
+- A grounded sample starts from a vague user request and invents a much more
+  specific benchmark problem without user-side evidence.
+- A grounded sample invents a multi-step execute_bash/search_docs workflow even
+  though the raw ticket only contains a high-level request or a final
+  resolution update.
+- A grounded sample converts assistant-provided URLs or portal instructions
+  into synthetic curl/wget verification traces that never appeared in the raw
+  conversation.
+- The candidate inserts ask_user_for_info even though the required information
+  is already present in the raw ticket.
+- The raw ticket already contains explicit commands, shell values, paths, or
+  observed failures, but the candidate fails to extract them into traces and
+  instead leaves the trace set too thin.
+
+Return exactly one JSON object:
+{
+  "is_valid": true or false,
+  "release_tier": "grounded" or "reconstructed",
+  "construction_mode": "extracted" or "reconstructed",
+  "has_reference_admin_reply": true or false,
+  "qa_flags": ["..."],
+  "qa_notes": "<short note>",
+  "repair_needed": true or false,
+  "repair_instructions": "<empty string if no repair is needed>"
+}
+"""
+
+REPAIR_SYSTEM_PROMPT = """\
+You are repairing a benchmark candidate record for an HPC agent dataset.
+
+Use the raw ticket and QA verdict to output a corrected canonical candidate.
+
+Rules:
+- Output valid JSON only.
+- Preserve the overall issue and solution intent of the raw ticket.
+- Fix information-gating problems by inserting ask_user_for_info before hidden
+  entities appear downstream.
+- When a raw assistant reply exists, set `evaluation.reference_admin_reply` to
+  the exact final assistant message from the raw ticket.
+- If the user-side grounding is too weak for a grounded sample, downgrade it to
+  `reconstructed` instead of inventing extra grounded detail.
+- If the raw ticket already contains explicit commands, shell values, file
+  paths, hostnames, or observed command output, prefer extracting them into
+  grounded traces instead of redundant ask_user_for_info.
+- Do not preserve curl/wget traces that merely verify assistant-provided URLs
+  or portal pages unless the raw ticket explicitly included those commands or
+  the resulting outputs.
+- If the raw ticket only provides a high-level request plus a final resolution,
+  remove invented internal execute_bash/search_docs tool chains rather than
+  preserving them as grounded.
+- Remove fabricated grounded reference_admin_reply content.
+- If the sample cannot be repaired into a valid benchmark item, return:
+  {"instance_id":"<ticket id>","is_valid":false}
+"""
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)],
 )
-
-_ACTION_CALL_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)\((.*)\)$", re.DOTALL)
-_ALLOWED_ACTIONS = {"execute_bash", "search_docs", "ask_user_for_info"}
+log = logging.getLogger(__name__)
 
 
 def _strip_fences(text: str) -> str:
-    """Remove markdown code fences if present."""
-    m = _FENCE_RE.search(text)
-    return m.group(1).strip() if m else text.strip()
+    cleaned = text.strip()
+    if not cleaned.startswith("```"):
+        return cleaned
+    lines = [
+        line
+        for line in cleaned.splitlines()
+        if not line.strip().startswith("```")
+    ]
+    return "\n".join(lines).strip()
 
 
-def _format_ticket(ticket_id: str, messages: List[str]) -> str:
-    """Turn the raw [role, msg, role, msg, ...] list into readable text."""
-    lines = [f"Ticket ID: {ticket_id}", ""]
-    for i in range(0, len(messages) - 1, 2):
-        role = messages[i]
-        body = messages[i + 1]
-        lines.append(f"[{role}]\n{body}\n")
-    return "\n".join(lines)
-
-
-def _load_checkpoint(ckpt_path: Path, out_path: Path) -> Tuple[Set[str], List[dict]]:
-    """Load already-processed results from checkpoint and/or existing output.
-
-    Returns (done_ids, results_so_far).
-    """
-    results: List[dict] = []
-    done: Set[str] = set()
-
-    # First, load from existing JSON output if it exists
-    if out_path.exists():
+def _parse_json(text: str) -> Optional[Dict[str, Any]]:
+    for candidate in (text.strip(), _strip_fences(text)):
+        if not candidate:
+            continue
         try:
-            with open(out_path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                if isinstance(data, list):
-                    for obj in data:
-                        iid = obj.get("instance_id")
-                        if iid and str(iid) not in done:
-                            done.add(str(iid))
-                            results.append(obj)
-        except (json.JSONDecodeError, Exception) as exc:
-            log.warning("Could not load %s: %s", out_path, exc)
-
-    # Then, layer on any additional entries from checkpoint
-    if ckpt_path.exists():
-        with open(ckpt_path, "r", encoding="utf-8") as fh:
-            for lineno, line in enumerate(fh, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    iid = obj.get("instance_id")
-                    if iid and str(iid) not in done:
-                        done.add(str(iid))
-                        results.append(obj)
-                except json.JSONDecodeError:
-                    log.warning("Corrupt line %d in checkpoint — skipping", lineno)
-
-    return done, results
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
-def _save_json(results: List[dict], path: Path) -> None:
-    """Atomically write results to JSON (write to tmp then rename)."""
-    tmp = path.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(results, fh, ensure_ascii=False, indent=2)
-    tmp.rename(path)
+def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
 
 
-def _parse_llm_json(raw: str, ticket_id: str) -> Optional[dict]:
-    """Try to parse the LLM output into a dict; return None on failure."""
-    # Try raw text first (avoids corrupting JSON that contains backticks)
-    try:
-        return json.loads(raw.strip())
-    except json.JSONDecodeError:
-        pass
-    # Fall back to stripping markdown fences
-    cleaned = _strip_fences(raw)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        log.debug("JSON parse failed for %s: %s", ticket_id, exc)
-        return None
+def _load_done_ids(path: Path) -> set[str]:
+    done_ids: set[str] = set()
+    for record in _iter_jsonl(path):
+        instance_id = str(record.get("instance_id", "")).strip()
+        if instance_id:
+            done_ids.add(instance_id)
+    return done_ids
 
 
-def _build_chat_messages(ticket_id: str, messages: List[str]) -> List[Dict[str, str]]:
-    """Build chat messages payload for OpenAI-compatible backends."""
-    user_content = _format_ticket(ticket_id, messages)
+def _append_jsonl(path: Path, records: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _write_jsonl(path: Path, records: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def _chunked(items: Sequence[Any], chunk_size: int) -> Iterable[Sequence[Any]]:
+    for start in range(0, len(items), chunk_size):
+        yield items[start : start + chunk_size]
+
+
+def _resolve_default_output(stage: str, output: str) -> Path:
+    if output:
+        return Path(output)
+    if stage in {"repair_or_filter", "all"}:
+        return DEFAULT_OUTPUT_DIR
+    filename_map = {
+        "preclassify": PRECLASSIFY_FILE,
+        "generate_candidate": CANDIDATE_FILE,
+        "validate_candidate": VALIDATED_FILE,
+    }
+    return DEFAULT_OUTPUT_DIR / filename_map[stage]
+
+
+def _resolve_input_path(stage: str, input_path: str, output_root: Path) -> Path:
+    if input_path:
+        return Path(input_path)
+    if stage == "preclassify":
+        return INPUT_FILE
+    if stage == "generate_candidate":
+        return output_root / PRECLASSIFY_FILE
+    if stage == "validate_candidate":
+        return output_root / CANDIDATE_FILE
+    if stage == "repair_or_filter":
+        return output_root / VALIDATED_FILE
+    raise ValueError(f"Unsupported stage {stage!r}")
+
+
+def _build_generator_messages(record: Dict[str, Any]) -> List[Dict[str, str]]:
+    default_candidate = record.get("preclassification", {}).get("candidate_class", "")
+    source_meta = record.get("source_meta", {})
+    user_content = (
+        f"Default candidate class: {default_candidate}\n"
+        f"Source meta: {json.dumps(source_meta, ensure_ascii=False)}\n\n"
+        f"{format_ticket_conversation(record['instance_id'], record.get('messages', []))}"
+    )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": GENERATOR_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
 
 
-def _build_fallback_prompt(ticket_id: str, messages: List[str]) -> str:
-    """Fallback plain prompt when chat template is unavailable."""
-    user_content = _format_ticket(ticket_id, messages)
-    return (
-        "System:\n" + SYSTEM_PROMPT + "\n\n"
-        "User:\n" + user_content + "\n\n"
-        "Assistant:\n"
+def _build_validator_messages(record: Dict[str, Any]) -> List[Dict[str, str]]:
+    candidate = record.get("candidate", {})
+    deterministic = record.get("deterministic_validation", {})
+    raw_reference = extract_reference_admin_reply(record.get("messages", []))
+    user_content = (
+        f"Preclassification: {json.dumps(record.get('preclassification', {}), ensure_ascii=False)}\n"
+        f"Source meta: {json.dumps(record.get('source_meta', {}), ensure_ascii=False)}\n"
+        f"Raw reference admin reply (if any): {raw_reference}\n"
+        f"Deterministic QA: {json.dumps(deterministic, ensure_ascii=False)}\n\n"
+        "Candidate canonical record:\n"
+        f"{json.dumps(candidate, ensure_ascii=False, indent=2)}\n\n"
+        "Raw ticket:\n"
+        f"{format_ticket_conversation(record['instance_id'], record.get('messages', []))}"
     )
+    return [
+        {"role": "system", "content": VALIDATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
 
 
-class _OfflineVLLMClient:
-    """Thin wrapper around vLLM offline inference."""
+def _build_repair_messages(record: Dict[str, Any]) -> List[Dict[str, str]]:
+    user_content = (
+        f"Validation verdict: {json.dumps(record.get('validation', {}), ensure_ascii=False)}\n\n"
+        "Candidate canonical record:\n"
+        f"{json.dumps(record.get('candidate', {}), ensure_ascii=False, indent=2)}\n\n"
+        "Raw ticket:\n"
+        f"{format_ticket_conversation(record['instance_id'], record.get('messages', []))}"
+    )
+    return [
+        {"role": "system", "content": REPAIR_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
 
-    def __init__(
-        self,
-        model_name: str,
-        temperature: float,
-        max_tokens: int,
-        tensor_parallel_size: int,
-        gpu_memory_utilization: float,
-        max_model_len: Optional[int],
-        dtype: Optional[str],
-        quantization: Optional[str],
-        enable_chunked_prefill: bool,
-    ) -> None:
-        try:
-            from vllm import LLM, SamplingParams
-        except ImportError as exc:
-            raise ImportError(
-                "vLLM offline mode requires the 'vllm' package. "
-                "Install it in your runtime environment before using --backend offline."
-            ) from exc
 
-        self._SamplingParams = SamplingParams
+def _process_batch_with_retries(
+    records: Sequence[Dict[str, Any]],
+    build_messages: Callable[[Dict[str, Any]], List[Dict[str, str]]],
+    handle_parsed: Callable[[Dict[str, Any], Optional[Dict[str, Any]], str, int], Optional[Dict[str, Any]]],
+    handle_failure: Callable[[Dict[str, Any], int, str], Dict[str, Any]],
+    client: LocalLLMClient,
+    batch_size: int,
+    max_retries: int,
+    max_tokens: int,
+    desc: str,
+) -> List[Dict[str, Any]]:
+    indexed_records = list(enumerate(records))
+    completed: Dict[int, Dict[str, Any]] = {}
+    pending = indexed_records
 
-        llm_kwargs = {
-            "model": model_name,
-            "tensor_parallel_size": tensor_parallel_size,
-            "gpu_memory_utilization": gpu_memory_utilization,
-            "trust_remote_code": True,
-            "enable_chunked_prefill": enable_chunked_prefill,
-        }
-        if max_model_len is not None and max_model_len > 0:
-            llm_kwargs["max_model_len"] = max_model_len
-        if dtype:
-            llm_kwargs["dtype"] = dtype
-        if quantization:
-            llm_kwargs["quantization"] = quantization
-
-        self._llm = LLM(
-            **llm_kwargs,
-        )
-        sampling_kwargs = {"temperature": temperature}
-        if max_tokens > 0:
-            sampling_kwargs["max_tokens"] = max_tokens
-        self._sampling_params = SamplingParams(**sampling_kwargs)
-        self._tokenizer = self._llm.get_tokenizer()
-
-    def _build_prompt(self, ticket_id: str, messages: List[str]) -> str:
-        chat_messages = _build_chat_messages(ticket_id, messages)
-        if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
+    for attempt in range(1, max_retries + 1):
+        if not pending:
+            break
+        next_pending: List[Tuple[int, Dict[str, Any]]] = []
+        for chunk in tqdm(list(_chunked(pending, batch_size)), desc=f"{desc} (attempt {attempt})"):
+            chunk_indices = [index for index, _ in chunk]
+            chunk_records = [record for _, record in chunk]
             try:
-                return self._tokenizer.apply_chat_template(
-                    chat_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
+                raw_responses = client.generate_batch(
+                    [build_messages(record) for record in chunk_records],
+                    temperature=DEFAULT_TEMPERATURE,
+                    max_tokens=max_tokens,
                 )
-            except Exception:
-                pass
-        return _build_fallback_prompt(ticket_id, messages)
-
-    def generate(self, ticket_id: str, messages: List[str]) -> str:
-        prompt = self._build_prompt(ticket_id, messages)
-        outputs = self._llm.generate([prompt], self._sampling_params, use_tqdm=False)
-        if not outputs or not outputs[0].outputs:
-            return ""
-        return outputs[0].outputs[0].text or ""
-
-
-def _normalize_trigger_command(trigger_command: str) -> Tuple[Optional[str], str]:
-    """Normalize trigger_command into action(parameter) format.
-
-    Returns:
-      (normalized_value_or_none, status)
-      status in {ok, wrapped_bash, removed_submit_solution, removed_unknown_action, invalid_empty}
-    """
-    compact = " ".join(trigger_command.split())
-    if not compact:
-        return None, "invalid_empty"
-
-    match = _ACTION_CALL_RE.match(compact)
-    if match:
-        action, params = match.group(1), match.group(2).strip()
-        if action == "submit_solution":
-            return None, "removed_submit_solution"
-        if action not in _ALLOWED_ACTIONS:
-            return None, "removed_unknown_action"
-        return f"{action}({params})", "ok"
-
-    return f"execute_bash({compact})", "wrapped_bash"
-
-
-def _normalize_traces(parsed: dict, ticket_id: str) -> None:
-    """Normalize parsed traces to the new list schema with strict action whitelist."""
-    stats = {
-        "converted_legacy_schema": 0,
-        "wrapped_bash": 0,
-        "removed_submit_solution": 0,
-        "removed_unknown_action": 0,
-        "dropped_invalid_entries": 0,
-    }
-
-    traces_raw = parsed.get("traces")
-    if isinstance(traces_raw, dict):
-        mock_states = traces_raw.get("mock_states")
-        if isinstance(mock_states, list):
-            traces_raw = mock_states
-            stats["converted_legacy_schema"] += 1
-        else:
-            traces_raw = []
-            stats["dropped_invalid_entries"] += 1
-    elif not isinstance(traces_raw, list):
-        traces_raw = []
-
-    normalized_traces: List[dict] = []
-    for item in traces_raw:
-        if not isinstance(item, dict):
-            stats["dropped_invalid_entries"] += 1
-            continue
-
-        trigger_command = item.get("trigger_command")
-        mock_output = item.get("mock_output")
-        if not isinstance(trigger_command, str) or not isinstance(mock_output, str):
-            stats["dropped_invalid_entries"] += 1
-            continue
-
-        normalized_trigger, status = _normalize_trigger_command(trigger_command)
-        if normalized_trigger is None:
-            if status in stats:
-                stats[status] += 1
-            else:
-                stats["dropped_invalid_entries"] += 1
-            continue
-
-        if status == "wrapped_bash":
-            stats["wrapped_bash"] += 1
-
-        normalized_traces.append(
-            {
-                "trigger_command": normalized_trigger,
-                "mock_output": mock_output.strip(),
-            }
-        )
-
-    parsed["traces"] = normalized_traces
-
-    if parsed.get("is_valid") is True and not normalized_traces:
-        parsed["is_valid"] = False
-        log.warning("%s: marked is_valid=false after trace normalization removed all traces.", ticket_id)
-
-    if any(stats.values()):
-        log.info("%s: normalization stats %s", ticket_id, stats)
-
-
-# ──────────────────────────────────────────────
-# Core async worker
-# ──────────────────────────────────────────────
-
-async def _process_one_server(
-    client: Any,
-    sem: asyncio.Semaphore,
-    ticket_id: str,
-    messages: List[str],
-) -> Optional[dict]:
-    """Call the server-mode LLM for one ticket, with retries + JSON repair."""
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        async with sem:
-            try:
-                resp = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=_build_chat_messages(ticket_id, messages),
-                        temperature=TEMPERATURE,
-                    ),
-                    timeout=REQUEST_TIMEOUT,
-                )
-            except asyncio.CancelledError:
-                # Graceful shutdown — don't retry, just exit
-                raise
             except Exception as exc:
                 log.error(
-                    "API error for %s (attempt %d/%d): %s",
-                    ticket_id, attempt, MAX_RETRIES, exc,
+                    "%s batch failed on attempt %d for %d record(s): %s",
+                    desc,
+                    attempt,
+                    len(chunk_records),
+                    exc,
                 )
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(min(2 ** attempt, 30))  # capped backoff
+                if attempt < max_retries:
+                    next_pending.extend(chunk)
                     continue
-                return None
-
-        raw = resp.choices[0].message.content or ""
-        parsed = _parse_llm_json(raw, ticket_id)
-
-        if parsed is not None:
-            if not isinstance(parsed, dict):
-                log.warning(
-                    "Unexpected JSON type for %s (attempt %d/%d): %s",
-                    ticket_id, attempt, MAX_RETRIES, type(parsed).__name__,
+                raw_responses = [""] * len(chunk_records)
+            if len(raw_responses) != len(chunk_records):
+                log.error(
+                    "%s batch returned %d responses for %d records on attempt %d; padding missing outputs.",
+                    desc,
+                    len(raw_responses),
+                    len(chunk_records),
+                    attempt,
                 )
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(1)
-                    continue
-                return None
-            _normalize_traces(parsed, ticket_id)
-            # Ensure instance_id is set
-            parsed.setdefault("instance_id", ticket_id)
-            return parsed
+                raw_responses = list(raw_responses[: len(chunk_records)])
+                raw_responses.extend([""] * (len(chunk_records) - len(raw_responses)))
+            for index, record, raw_response in zip(chunk_indices, chunk_records, raw_responses):
+                parsed = _parse_json(raw_response)
+                handled = handle_parsed(record, parsed, raw_response, attempt)
+                if handled is not None:
+                    completed[index] = handled
+                elif attempt < max_retries:
+                    next_pending.append((index, record))
+                else:
+                    completed[index] = handle_failure(record, attempt, raw_response)
+        pending = next_pending
 
-        log.warning(
-            "JSON parse failed for %s (attempt %d/%d). Raw (first 300 chars): %s",
-            ticket_id, attempt, MAX_RETRIES, raw[:300],
-        )
-        if attempt < MAX_RETRIES:
-            await asyncio.sleep(1)
+    for index, record in pending:
+        completed[index] = handle_failure(record, max_retries, "")
 
-    log.error("Giving up on %s after %d attempts.", ticket_id, MAX_RETRIES)
-    return None
+    return [completed[index] for index in range(len(records))]
 
 
-def _process_one_offline(
-    client: _OfflineVLLMClient,
-    ticket_id: str,
-    messages: List[str],
-) -> Optional[dict]:
-    """Call the offline vLLM backend for one ticket, with retries + JSON repair."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            raw = client.generate(ticket_id, messages)
-        except Exception as exc:
-            log.error(
-                "Offline generation error for %s (attempt %d/%d): %s",
-                ticket_id, attempt, MAX_RETRIES, exc,
+def run_preclassify(
+    raw_path: Path,
+    output_path: Path,
+    limit: int,
+    resume: bool,
+) -> Path:
+    if output_path.exists() and not resume:
+        output_path.unlink()
+
+    with raw_path.open("r", encoding="utf-8") as handle:
+        raw_tickets = json.load(handle)
+
+    done_ids = _load_done_ids(output_path) if resume and output_path.exists() else set()
+    items = list(raw_tickets.items())
+    if limit > 0:
+        items = items[:limit]
+
+    pending_records = []
+    for ticket_id, messages in items:
+        ticket_id = str(ticket_id)
+        if ticket_id in done_ids:
+            continue
+        pending_records.append(preclassify_ticket(ticket_id, messages))
+
+    if pending_records:
+        _append_jsonl(output_path, pending_records)
+    log.info("Preclassified %d ticket(s) into %s", len(pending_records), output_path)
+    return output_path
+
+
+def run_generate_candidate(
+    input_path: Path,
+    output_path: Path,
+    client: LocalLLMClient,
+    model: str,
+    batch_size: int,
+    max_retries: int,
+    max_tokens: int,
+    resume: bool,
+) -> Path:
+    if output_path.exists() and not resume:
+        output_path.unlink()
+
+    records = list(_iter_jsonl(input_path))
+    done_ids = _load_done_ids(output_path) if resume and output_path.exists() else set()
+    pending: List[Dict[str, Any]] = []
+    immediate_results: List[Dict[str, Any]] = []
+
+    for record in records:
+        instance_id = str(record.get("instance_id", ""))
+        if instance_id in done_ids:
+            continue
+        candidate_class = record.get("preclassification", {}).get("candidate_class")
+        if candidate_class == "invalid":
+            invalid_candidate = normalize_canonical_candidate(
+                {"instance_id": instance_id, "is_valid": False},
+                record,
+                generator_model=model,
             )
-            if attempt < MAX_RETRIES:
-                continue
+            invalid_candidate["quality"]["qa_flags"].append("preclassified_invalid")
+            immediate_results.append(
+                {
+                    **record,
+                    "candidate": invalid_candidate,
+                    "generator_raw_response": "",
+                    "generator_attempts": 0,
+                }
+            )
+        else:
+            pending.append(record)
+
+    def handle_parsed(
+        record: Dict[str, Any],
+        parsed: Optional[Dict[str, Any]],
+        raw_response: str,
+        attempt: int,
+    ) -> Optional[Dict[str, Any]]:
+        if parsed is None:
             return None
+        candidate = normalize_canonical_candidate(parsed, record, generator_model=model)
+        return {
+            **record,
+            "candidate": candidate,
+            "generator_raw_response": raw_response,
+            "generator_attempts": attempt,
+        }
 
-        parsed = _parse_llm_json(raw, ticket_id)
+    def handle_failure(record: Dict[str, Any], attempt: int, raw_response: str) -> Dict[str, Any]:
+        candidate = normalize_canonical_candidate(
+            {"instance_id": record["instance_id"], "is_valid": False},
+            record,
+            generator_model=model,
+        )
+        candidate["quality"]["qa_flags"].append("generation_failed")
+        return {
+            **record,
+            "candidate": candidate,
+            "generator_raw_response": raw_response,
+            "generator_attempts": attempt,
+        }
 
-        if parsed is not None:
-            if not isinstance(parsed, dict):
-                log.warning(
-                    "Unexpected JSON type for %s (attempt %d/%d): %s",
-                    ticket_id, attempt, MAX_RETRIES, type(parsed).__name__,
-                )
-                if attempt < MAX_RETRIES:
-                    continue
-                return None
-            _normalize_traces(parsed, ticket_id)
-            parsed.setdefault("instance_id", ticket_id)
-            return parsed
+    staged_results = _process_batch_with_retries(
+        pending,
+        build_messages=_build_generator_messages,
+        handle_parsed=handle_parsed,
+        handle_failure=handle_failure,
+        client=client,
+        batch_size=batch_size,
+        max_retries=max_retries,
+        max_tokens=max_tokens,
+        desc="generate_candidate",
+    )
 
-        log.warning(
-            "JSON parse failed for %s (attempt %d/%d). Raw (first 300 chars): %s",
-            ticket_id, attempt, MAX_RETRIES, raw[:300],
+    if immediate_results:
+        _append_jsonl(output_path, immediate_results)
+    if staged_results:
+        _append_jsonl(output_path, staged_results)
+    log.info(
+        "Generated %d candidate record(s) into %s",
+        len(immediate_results) + len(staged_results),
+        output_path,
+    )
+    return output_path
+
+
+def run_validate_candidate(
+    input_path: Path,
+    output_path: Path,
+    client: LocalLLMClient,
+    batch_size: int,
+    max_retries: int,
+    max_tokens: int,
+    resume: bool,
+) -> Path:
+    if output_path.exists() and not resume:
+        output_path.unlink()
+
+    records = list(_iter_jsonl(input_path))
+    done_ids = _load_done_ids(output_path) if resume and output_path.exists() else set()
+
+    pending: List[Dict[str, Any]] = []
+    immediate_results: List[Dict[str, Any]] = []
+    for record in records:
+        instance_id = str(record.get("instance_id", ""))
+        if instance_id in done_ids:
+            continue
+        candidate = record.get("candidate", {})
+        deterministic = deterministic_validate_canonical(candidate)
+        record = {**record, "deterministic_validation": deterministic}
+        if not candidate.get("is_valid", True):
+            immediate_results.append(
+                {
+                    **record,
+                    "validation": deterministic,
+                    "validator_raw_response": "",
+                    "validator_attempts": 0,
+                }
+            )
+        else:
+            pending.append(record)
+
+    def handle_parsed(
+        record: Dict[str, Any],
+        parsed: Optional[Dict[str, Any]],
+        raw_response: str,
+        attempt: int,
+    ) -> Optional[Dict[str, Any]]:
+        merged = merge_validation_verdict(record.get("candidate", {}), parsed)
+        return {
+            **record,
+            "validation": merged,
+            "validator_raw_response": raw_response,
+            "validator_attempts": attempt,
+        }
+
+    def handle_failure(record: Dict[str, Any], attempt: int, raw_response: str) -> Dict[str, Any]:
+        merged = merge_validation_verdict(record.get("candidate", {}), None)
+        merged["qa_flags"] = sorted(set(merged["qa_flags"]) | {"validator_failed"})
+        return {
+            **record,
+            "validation": merged,
+            "validator_raw_response": raw_response,
+            "validator_attempts": attempt,
+        }
+
+    staged_results = _process_batch_with_retries(
+        pending,
+        build_messages=_build_validator_messages,
+        handle_parsed=handle_parsed,
+        handle_failure=handle_failure,
+        client=client,
+        batch_size=batch_size,
+        max_retries=max_retries,
+        max_tokens=max_tokens,
+        desc="validate_candidate",
+    )
+
+    if immediate_results:
+        _append_jsonl(output_path, immediate_results)
+    if staged_results:
+        _append_jsonl(output_path, staged_results)
+    log.info(
+        "Validated %d candidate record(s) into %s",
+        len(immediate_results) + len(staged_results),
+        output_path,
+    )
+    return output_path
+
+
+def run_repair_or_filter(
+    input_path: Path,
+    output_dir: Path,
+    client: LocalLLMClient,
+    model: str,
+    batch_size: int,
+    max_retries: int,
+    max_tokens: int,
+    tier: str,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    records = list(_iter_jsonl(input_path))
+
+    final_records_by_index: Dict[int, Dict[str, Any]] = {}
+    pending_repair: List[Tuple[int, Dict[str, Any]]] = []
+    for record_index, record in enumerate(records):
+        verdict = record.get("validation", {})
+        candidate = record.get("candidate", {})
+        if verdict.get("repair_needed") and candidate.get("is_valid", True):
+            pending_repair.append((record_index, record))
+        else:
+            final_records_by_index[record_index] = (
+                apply_validation_verdict(candidate, verdict, validator_model=model)
+            )
+
+    def _fallback_preserving_candidate(record: Dict[str, Any], extra_flags: Sequence[str]) -> Dict[str, Any]:
+        candidate = record.get("candidate", {})
+        baseline = deterministic_validate_canonical(candidate)
+        prior_validation = record.get("validation", {})
+
+        if prior_validation.get("release_tier") == "reconstructed":
+            baseline["release_tier"] = "reconstructed"
+            baseline["construction_mode"] = "reconstructed"
+        if isinstance(prior_validation.get("has_reference_admin_reply"), bool):
+            baseline["has_reference_admin_reply"] = (
+                prior_validation["has_reference_admin_reply"]
+                and bool(candidate.get("evaluation", {}).get("reference_admin_reply", "").strip())
+            )
+
+        baseline["qa_flags"] = sorted(
+            set(baseline.get("qa_flags", []))
+            | set(prior_validation.get("qa_flags", []))
+            | set(extra_flags)
+        )
+        baseline["qa_notes"] = str(prior_validation.get("qa_notes", "")).strip()
+        baseline["repair_needed"] = False
+        baseline["repair_instructions"] = ""
+        return apply_validation_verdict(
+            candidate,
+            baseline,
+            validator_model=model,
         )
 
-    log.error("Giving up on %s after %d attempts.", ticket_id, MAX_RETRIES)
-    return None
+    def handle_parsed(
+        record: Dict[str, Any],
+        parsed: Optional[Dict[str, Any]],
+        raw_response: str,
+        attempt: int,
+    ) -> Optional[Dict[str, Any]]:
+        if parsed is None:
+            return None
+        repaired_candidate = normalize_canonical_candidate(parsed, record, generator_model=model)
+        post_repair = deterministic_validate_canonical(repaired_candidate)
+        post_repair["qa_flags"] = sorted(set(post_repair["qa_flags"]) | {"repair_applied"})
+        repaired_final = apply_validation_verdict(
+            repaired_candidate,
+            post_repair,
+            validator_model=model,
+        )
+        if repaired_final.get("is_valid", True):
+            return repaired_final
+        fallback = _fallback_preserving_candidate(
+            record,
+            extra_flags={"repair_applied", "repair_regressed_to_invalid"},
+        )
+        if fallback.get("is_valid", False):
+            return fallback
+        return repaired_final
+
+    def handle_failure(record: Dict[str, Any], attempt: int, raw_response: str) -> Dict[str, Any]:
+        fallback = dict(record.get("validation", {}))
+        fallback["qa_flags"] = sorted(set(fallback.get("qa_flags", [])) | {"repair_failed"})
+        failed_result = apply_validation_verdict(record.get("candidate", {}), fallback, validator_model=model)
+        if failed_result.get("is_valid", True):
+            return failed_result
+        preserved = _fallback_preserving_candidate(
+            record,
+            extra_flags={"repair_failed", "repair_preserved_candidate"},
+        )
+        return preserved if preserved.get("is_valid", False) else failed_result
+
+    repaired_records = [record for _, record in pending_repair]
+    repaired_results = _process_batch_with_retries(
+        repaired_records,
+        build_messages=_build_repair_messages,
+        handle_parsed=handle_parsed,
+        handle_failure=handle_failure,
+        client=client,
+        batch_size=batch_size,
+        max_retries=max_retries,
+        max_tokens=max_tokens,
+        desc="repair_or_filter",
+    )
+    for (record_index, _), repaired_record in zip(pending_repair, repaired_results):
+        final_records_by_index[record_index] = repaired_record
+
+    final_records = [
+        final_records_by_index[index]
+        for index in range(len(records))
+        if index in final_records_by_index
+    ]
+
+    canonical_path = output_dir / FINAL_CANONICAL_FILE
+    _write_jsonl(canonical_path, final_records)
+
+    runtime_grounded = [
+        project_runtime_record(record)
+        for record in final_records
+        if record.get("is_valid", True) and record.get("release_tier") == "grounded"
+    ]
+    runtime_reconstructed = [
+        project_runtime_record(record)
+        for record in final_records
+        if record.get("is_valid", True) and record.get("release_tier") == "reconstructed"
+    ]
+
+    if tier in {"all", "grounded"}:
+        _write_json(output_dir / RUNTIME_GROUNDED_FILE, runtime_grounded)
+    if tier in {"all", "reconstructed"}:
+        _write_json(output_dir / RUNTIME_RECONSTRUCTED_FILE, runtime_reconstructed)
+
+    quality_report = summarize_canonical_dataset(final_records)
+    _write_json(output_dir / QUALITY_REPORT_FILE, quality_report)
+
+    log.info(
+        "Exported %d canonical record(s), %d grounded runtime record(s), and %d reconstructed runtime record(s) into %s",
+        len(final_records),
+        len(runtime_grounded),
+        len(runtime_reconstructed),
+        output_dir,
+    )
+    return canonical_path
 
 
-# ──────────────────────────────────────────────
-# Main orchestrator
-# ──────────────────────────────────────────────
+def _run_cleaned_audit(dataset_path: Path, output_path: Optional[Path]) -> None:
+    with dataset_path.open("r", encoding="utf-8") as handle:
+        dataset = json.load(handle)
+    report = audit_cleaned_dataset(dataset)
+    rendered = json.dumps(report, ensure_ascii=False, indent=2)
+    print(rendered)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered, encoding="utf-8")
 
-async def main() -> None:
-    global MODEL_NAME
 
-    # ── CLI args ──────────────────────────────
-    parser = argparse.ArgumentParser(description="Process HPC tickets → benchmark JSON")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Build HPC-AgentBench v2 artifacts from raw tickets.")
+    parser.add_argument(
+        "--stage",
+        choices=["preclassify", "generate_candidate", "validate_candidate", "repair_or_filter", "all"],
+        default="all",
+        help="Pipeline stage to run.",
+    )
+    parser.add_argument(
+        "--input",
+        default="",
+        help="Stage input path. Defaults to the standard previous-stage artifact.",
+    )
+    parser.add_argument(
+        "--output",
+        default="",
+        help="Stage output path for single stages, or output directory for repair_or_filter/all.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume single-stage JSONL outputs by skipping already-written instance_ids.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Number of prompts per vLLM batch.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help="Maximum retries for generation/validation/repair per record.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Process at most N raw tickets during preclassify.",
+    )
+    parser.add_argument(
+        "--tier",
+        choices=["all", "grounded", "reconstructed"],
+        default="all",
+        help="Which runtime tier projections to export during repair_or_filter/all.",
+    )
     parser.add_argument(
         "--backend",
         choices=["server", "offline"],
-        default=BACKEND_MODE,
-        help="Inference backend: server (OpenAI-compatible API) or offline (vLLM local inference)",
+        default="offline",
+        help="Inference backend. Offline in-process is the primary mode.",
     )
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Process at most N tickets (0 = all)")
+    parser.add_argument("--model", default=DEFAULT_LLM_MODEL, help="Generator/validator/repair model.")
     parser.add_argument(
-        "--model",
-        default=MODEL_NAME,
-        help="Model name/path for backend inference",
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMPERATURE,
+        help="Sampling temperature for all pipeline LLM calls.",
     )
     parser.add_argument(
-        "--offline-max-tokens",
+        "--generator-max-tokens",
         type=int,
-        default=OFFLINE_MAX_TOKENS,
-        help="Max generated tokens per request for offline backend (0 = no explicit max_tokens limit)",
+        default=GENERATOR_MAX_TOKENS,
+        help="Maximum generated tokens for the candidate generation stage.",
     )
+    parser.add_argument(
+        "--validator-max-tokens",
+        type=int,
+        default=VALIDATOR_MAX_TOKENS,
+        help="Maximum generated tokens for the validator stage.",
+    )
+    parser.add_argument(
+        "--repair-max-tokens",
+        type=int,
+        default=REPAIR_MAX_TOKENS,
+        help="Maximum generated tokens for the repair stage.",
+    )
+    parser.add_argument("--server-base-url", default=DEFAULT_SERVER_BASE_URL)
+    parser.add_argument("--server-api-key", default=DEFAULT_SERVER_API_KEY)
     parser.add_argument(
         "--offline-tensor-parallel-size",
         type=int,
-        default=OFFLINE_TENSOR_PARALLEL_SIZE,
-        help="Tensor parallel size for offline vLLM",
+        default=DEFAULT_OFFLINE_TENSOR_PARALLEL_SIZE,
     )
     parser.add_argument(
         "--offline-gpu-memory-utilization",
         type=float,
-        default=OFFLINE_GPU_MEMORY_UTILIZATION,
-        help="GPU memory utilization fraction for offline vLLM",
+        default=DEFAULT_OFFLINE_GPU_MEMORY_UTILIZATION,
     )
     parser.add_argument(
         "--offline-max-model-len",
         type=int,
-        default=OFFLINE_MAX_MODEL_LEN,
-        help="Max model context length for offline vLLM (0 disables explicit override)",
+        default=DEFAULT_OFFLINE_MAX_MODEL_LEN,
     )
-    parser.add_argument(
-        "--offline-dtype",
-        default=OFFLINE_DTYPE,
-        help="dtype for offline vLLM (e.g., bfloat16, float16)",
-    )
-    parser.add_argument(
-        "--offline-quantization",
-        default=OFFLINE_QUANTIZATION,
-        help="quantization for offline vLLM (e.g., fp8, awq, gptq); empty string disables",
-    )
+    parser.add_argument("--offline-dtype", default=DEFAULT_OFFLINE_DTYPE)
+    parser.add_argument("--offline-quantization", default=DEFAULT_OFFLINE_QUANTIZATION)
     parser.add_argument(
         "--offline-enable-chunked-prefill",
         action="store_true",
-        help="Enable chunked prefill in offline vLLM",
+        default=DEFAULT_OFFLINE_ENABLE_CHUNKED_PREFILL,
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--audit-cleaned",
+        default="",
+        help="Audit an existing runtime-format cleaned dataset instead of running the pipeline.",
+    )
+    parser.add_argument(
+        "--audit-output",
+        default="",
+        help="Optional path to save the audit JSON.",
+    )
+    return parser
 
-    MODEL_NAME = args.model
 
-    log.info("Loading tickets from %s …", INPUT_FILE)
-    with open(INPUT_FILE, "r", encoding="utf-8") as fh:
-        raw_tickets: Dict[str, list] = json.load(fh)
-    log.info("Loaded %d ticket IDs.", len(raw_tickets))
-
-    # ── Pre-filter ────────────────────────────
-    done_ids, existing_results = _load_checkpoint(CHECKPOINT_FILE, OUTPUT_FILE)
-    log.info("Found %d already-processed IDs (resuming).", len(done_ids))
-
-    todo: List[Tuple[str, List[str]]] = []
-    skipped_empty = 0
-    skipped_short = 0
-    skipped_done = 0
-
-    for tid, msgs in raw_tickets.items():
-        if tid in done_ids:
-            skipped_done += 1
-            continue
-        if not msgs:
-            skipped_empty += 1
-            continue
-        total_text = " ".join(msgs)
-        if len(total_text) < MIN_TICKET_CHARS:
-            skipped_short += 1
-            continue
-        todo.append((tid, msgs))
-
-    log.info(
-        "To process: %d | Skipped → already done: %d, empty: %d, short: %d",
-        len(todo), skipped_done, skipped_empty, skipped_short,
+def _build_client(args: argparse.Namespace) -> LocalLLMClient:
+    return LocalLLMClient(
+        backend=args.backend,
+        model=args.model,
+        temperature=args.temperature,
+        max_tokens=args.generator_max_tokens,
+        server_base_url=args.server_base_url,
+        server_api_key=args.server_api_key,
+        offline_tensor_parallel_size=args.offline_tensor_parallel_size,
+        offline_gpu_memory_utilization=args.offline_gpu_memory_utilization,
+        offline_max_model_len=args.offline_max_model_len,
+        offline_dtype=args.offline_dtype,
+        offline_quantization=args.offline_quantization,
+        offline_enable_chunked_prefill=args.offline_enable_chunked_prefill,
     )
 
-    if not todo:
-        log.info("Nothing to do. Exiting.")
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    if args.audit_cleaned:
+        _run_cleaned_audit(
+            Path(args.audit_cleaned),
+            Path(args.audit_output) if args.audit_output else None,
+        )
         return
 
-    if args.limit > 0:
-        todo = todo[:args.limit]
-        log.info("--limit %d applied, will process %d tickets.", args.limit, len(todo))
+    stage = args.stage
+    output_root = _resolve_default_output(stage, args.output)
+    if stage in {"preclassify", "generate_candidate", "validate_candidate"} and not output_root.suffix:
+        filename_map = {
+            "preclassify": PRECLASSIFY_FILE,
+            "generate_candidate": CANDIDATE_FILE,
+            "validate_candidate": VALIDATED_FILE,
+        }
+        output_root = output_root / filename_map[stage]
+    if stage == "all":
+        output_root.mkdir(parents=True, exist_ok=True)
 
-    # Checkpoint file for crash recovery (append-mode JSONL)
-    ckpt_fh = open(CHECKPOINT_FILE, "a", encoding="utf-8")
-    new_results: List[dict] = []
-    results_lock = asyncio.Lock()
-    completed_since_save = 0
-    shutting_down = False
+    if stage == "preclassify":
+        input_path = _resolve_input_path(stage, args.input, DEFAULT_OUTPUT_DIR)
+        output_path = output_root
+        run_preclassify(input_path, output_path, args.limit, args.resume)
+        return
 
-    def _finalize() -> None:
-        """Merge and save final JSON (called on success or shutdown)."""
-        all_results = existing_results + new_results
-        _save_json(all_results, OUTPUT_FILE)
-        log.info("Saved %d total results to %s", len(all_results), OUTPUT_FILE)
+    client = _build_client(args)
+    try:
+        if stage == "generate_candidate":
+            input_path = _resolve_input_path(stage, args.input, output_root.parent if output_root.suffix else output_root)
+            run_generate_candidate(
+                input_path=input_path,
+                output_path=output_root,
+                client=client,
+                model=args.model,
+                batch_size=args.batch_size,
+                max_retries=args.max_retries,
+                max_tokens=args.generator_max_tokens,
+                resume=args.resume,
+            )
+            return
 
-    # ── Graceful shutdown handler ─────────────
-    def _handle_signal(signum, frame):
-        nonlocal shutting_down
-        if shutting_down:
-            return  # already handling
-        shutting_down = True
-        signame = signal.Signals(signum).name
-        log.warning("Received %s — saving progress and exiting …", signame)
-        ckpt_fh.close()
-        _finalize()
-        log.info("Progress saved. Safe to restart — will resume automatically.")
-        sys.exit(0)
+        if stage == "validate_candidate":
+            input_path = _resolve_input_path(stage, args.input, output_root.parent if output_root.suffix else output_root)
+            run_validate_candidate(
+                input_path=input_path,
+                output_path=output_root,
+                client=client,
+                batch_size=args.batch_size,
+                max_retries=args.max_retries,
+                max_tokens=args.validator_max_tokens,
+                resume=args.resume,
+            )
+            return
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+        if stage == "repair_or_filter":
+            output_dir = output_root
+            input_path = _resolve_input_path(stage, args.input, output_dir)
+            run_repair_or_filter(
+                input_path=input_path,
+                output_dir=output_dir,
+                client=client,
+                model=args.model,
+                batch_size=args.batch_size,
+                max_retries=args.max_retries,
+                max_tokens=args.repair_max_tokens,
+                tier=args.tier,
+            )
+            return
 
-    if args.backend == "server":
-        from openai import AsyncOpenAI
-        from tqdm.asyncio import tqdm_asyncio
+        if stage == "all":
+            preclassify_path = output_root / PRECLASSIFY_FILE
+            candidate_path = output_root / CANDIDATE_FILE
+            validated_path = output_root / VALIDATED_FILE
 
-        log.info("Backend mode: server (OpenAI-compatible API at %s)", API_BASE)
-        client = AsyncOpenAI(base_url=API_BASE, api_key=API_KEY)
-        sem = asyncio.Semaphore(MAX_CONCURRENT)
-
-        async def _worker(tid: str, msgs: List[str]) -> None:
-            nonlocal completed_since_save
-            if shutting_down:
-                return
-            result = await _process_one_server(client, sem, tid, msgs)
-            if result is not None:
-                # Write to checkpoint immediately for crash recovery
-                ckpt_fh.write(json.dumps(result, ensure_ascii=False) + "\n")
-                ckpt_fh.flush()
-                async with results_lock:
-                    new_results.append(result)
-                    completed_since_save += 1
-                    # Periodic snapshot so we don't lose everything on hard crash
-                    if completed_since_save >= SAVE_EVERY:
-                        completed_since_save = 0
-                        _finalize()
-
-        tasks = [_worker(tid, msgs) for tid, msgs in todo]
-        await tqdm_asyncio.gather(*tasks, desc="Processing tickets")
-        await client.close()
-    else:
-        log.info("Backend mode: offline (vLLM local inference)")
-        log.info(
-            "Offline config → model=%s, max_tokens=%d, tensor_parallel=%d, gpu_mem_util=%.2f, max_model_len=%d, dtype=%s, quantization=%s, chunked_prefill=%s",
-            MODEL_NAME,
-            args.offline_max_tokens,
-            args.offline_tensor_parallel_size,
-            args.offline_gpu_memory_utilization,
-            args.offline_max_model_len,
-            args.offline_dtype or "auto",
-            args.offline_quantization or "none",
-            args.offline_enable_chunked_prefill,
-        )
-        client = _OfflineVLLMClient(
-            model_name=MODEL_NAME,
-            temperature=TEMPERATURE,
-            max_tokens=args.offline_max_tokens,
-            tensor_parallel_size=args.offline_tensor_parallel_size,
-            gpu_memory_utilization=args.offline_gpu_memory_utilization,
-            max_model_len=args.offline_max_model_len,
-            dtype=(args.offline_dtype or None),
-            quantization=(args.offline_quantization or None),
-            enable_chunked_prefill=args.offline_enable_chunked_prefill,
-        )
-        for tid, msgs in tqdm(todo, desc="Processing tickets"):
-            if shutting_down:
-                break
-            result = _process_one_offline(client, tid, msgs)
-            if result is None:
-                continue
-
-            ckpt_fh.write(json.dumps(result, ensure_ascii=False) + "\n")
-            ckpt_fh.flush()
-            new_results.append(result)
-            completed_since_save += 1
-            if completed_since_save >= SAVE_EVERY:
-                completed_since_save = 0
-                _finalize()
-
-    ckpt_fh.close()
-
-    # Final save
-    _finalize()
-
-    # Clean up checkpoint since final JSON is written
-    if CHECKPOINT_FILE.exists():
-        CHECKPOINT_FILE.unlink()
-
-    log.info("All done. %d total results in %s", len(existing_results) + len(new_results), OUTPUT_FILE)
+            run_preclassify(INPUT_FILE, preclassify_path, args.limit, args.resume)
+            run_generate_candidate(
+                input_path=preclassify_path,
+                output_path=candidate_path,
+                client=client,
+                model=args.model,
+                batch_size=args.batch_size,
+                max_retries=args.max_retries,
+                max_tokens=args.generator_max_tokens,
+                resume=args.resume,
+            )
+            run_validate_candidate(
+                input_path=candidate_path,
+                output_path=validated_path,
+                client=client,
+                batch_size=args.batch_size,
+                max_retries=args.max_retries,
+                max_tokens=args.validator_max_tokens,
+                resume=args.resume,
+            )
+            run_repair_or_filter(
+                input_path=validated_path,
+                output_dir=output_root,
+                client=client,
+                model=args.model,
+                batch_size=args.batch_size,
+                max_retries=args.max_retries,
+                max_tokens=args.repair_max_tokens,
+                tier=args.tier,
+            )
+            return
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -54,3 +54,6 @@ remove_query_field.py
 # ---------- Reports / logs ----------
 *_report.txt
 *.log
+
+pipeline_*
+backup/

@@ -5,17 +5,7 @@ description = "LLM-driven Semantic HNSW Index"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy<2.0.0",
-    "pydantic",
-    "pyyaml",
     "tqdm",
-    "scikit-learn", # For cosine similarity in mock
-    "torch",
-    "faiss-gpu",
-    "FlagEmbedding",
-    "pytrec-eval-terrier",
-    "google-generativeai",
-    "datasets",
     "openai",
     "vllm",
 ]
